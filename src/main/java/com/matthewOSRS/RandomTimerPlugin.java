@@ -51,6 +51,9 @@ public class RandomTimerPlugin extends Plugin
 	private InfoBoxManager infoBoxManager; // Manages compact infobox tiles on the HUD
 
 	@Inject
+	private AudioPlayer audioPlayer; // RuneLite's approved audio playback API
+
+	@Inject
 	private ClientToolbar clientToolbar; // The left sidebar toolbar
 
 	// --- Internal state ---
@@ -269,7 +272,7 @@ public class RandomTimerPlugin extends Plugin
 			// AudioPlayer is RuneLite's approved audio API.
 			// It handles threading and resource cleanup internally —
 			// no need to manage Clips, Lines, or AudioStreams manually.
-			AudioPlayer.play(soundFile);
+			audioPlayer.play(soundFile, 1.0f);
 		}
 		catch (Exception e)
 		{
@@ -348,7 +351,7 @@ public class RandomTimerPlugin extends Plugin
 				Files.write(tempFile, wavStream.readAllBytes());
 
 				// Play via RuneLite's approved AudioPlayer API
-				AudioPlayer.play(tempFile.toFile());
+				audioPlayer.play(tempFile.toFile(), 1.0f);
 
 				// Give the audio time to finish before deleting the temp file
 				Thread.sleep(2500);
