@@ -23,8 +23,11 @@ import java.io.File;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
-import javax.sound.sampled.*;
-import java.nio.ByteBuffer;
+import net.runelite.client.audio.AudioPlayer;
+
+import java.io.ByteArrayInputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 // @Slf4j gives us a `log` object for debug/info logging (like console.log in JS)
 @Slf4j
@@ -246,127 +249,170 @@ public class RandomTimerPlugin extends Plugin
 	// --- Sound playback ---
 
 	/**
-	 * Plays a .wav file from an absolute path on the user's filesystem.
-	 * Runs on a background thread so it doesn't freeze the game.
+	 * Plays a .wav file from an absolute path using RuneLite's AudioPlayer.
 	 *
 	 * @param filePath Absolute path to the .wav file (e.g. C:/sounds/alarm.wav)
 	 */
 	private void playSound(String filePath)
 	{
-		// Run audio in a separate thread — audio loading can be slow
-		new Thread(() ->
+		File soundFile = new File(filePath);
+
+		// Security: verify the file exists and is a .wav before attempting playback
+		if (!soundFile.exists() || !filePath.toLowerCase().endsWith(".wav"))
 		{
-			try
-			{
-				File soundFile = new File(filePath);
+			log.warn("Sound file not found or not a .wav: {}", filePath);
+			return;
+		}
 
-				// Security: only allow .wav files and ensure the file actually exists
-				if (!soundFile.exists() || !filePath.toLowerCase().endsWith(".wav"))
-				{
-					log.warn("Sound file not found or not a .wav: {}", filePath);
-					return;
-				}
-
-				// Java's AudioInputStream reads audio data from the file
-				AudioInputStream audioStream = AudioSystem.getAudioInputStream(soundFile);
-				Clip clip = AudioSystem.getClip();
-				clip.open(audioStream);
-				clip.start();
-
-				// Wait for the clip to finish before closing it
-				clip.addLineListener(e ->
-				{
-					if (e.getType() == LineEvent.Type.STOP)
-					{
-						clip.close();
-					}
-				});
-			}
-			catch (Exception e)
-			{
-				log.error("Failed to play sound file: {}", filePath, e);
-			}
-		}).start();
+		try
+		{
+			// AudioPlayer is RuneLite's approved audio API.
+			// It handles threading and resource cleanup internally —
+			// no need to manage Clips, Lines, or AudioStreams manually.
+			AudioPlayer.play(soundFile);
+		}
+		catch (Exception e)
+		{
+			log.error("Failed to play sound file: {}", filePath, e);
+		}
 	}
 
 	/**
-	 * Generates and plays a classic alarm clock beep pattern entirely in code.
-	 * No external sound file required — uses Java's synthesized audio API.
+	 * Generates a classic 3-beep alarm tone and plays it via RuneLite's AudioPlayer.
 	 *
-	 * How it works: we build raw PCM audio samples (the same format as a .wav file)
-	 * by calculating a sine wave for each beep, then feed that directly to Java's
-	 * audio Clip. Think of PCM as the raw pixel data of audio — just numbers.
+	 * Since AudioPlayer only accepts File inputs, we:
+	 *   1. Build raw PCM audio data as a byte array (sine wave math)
+	 *   2. Wrap it in a valid .wav file structure
+	 *   3. Write it to a temp file
+	 *   4. Play that temp file via AudioPlayer
+	 *   5. Delete the temp file after playback
+	 *
+	 * PCM (Pulse Code Modulation) is the raw sample format inside a .wav file —
+	 * think of each sample as one snapshot of the audio waveform at a point in time.
 	 */
 	private void playGeneratedAlarm()
 	{
 		new Thread(() ->
 		{
+			Path tempFile = null;
 			try
 			{
-				// AudioFormat defines the "shape" of our audio data:
-				//   44100 Hz  = CD-quality sample rate (samples per second)
-				//   16-bit    = each sample is a 16-bit integer (-32768 to 32767)
-				//   1 channel = mono (no stereo needed for an alarm beep)
-				//   signed, big-endian = standard byte ordering for Java audio
-				float sampleRate   = 44100f;
-				int   bitsPerSample = 16;
-				int   channels      = 1;
-				AudioFormat format  = new AudioFormat(sampleRate, bitsPerSample, channels, true, true);
+				// --- Audio parameters ---
+				int sampleRate     = 44100; // CD-quality: 44100 samples per second
+				int bitsPerSample  = 16;    // Each sample is a 16-bit signed integer
+				int channels       = 1;     // Mono
 
-				// Alarm pattern: 3 short beeps (like a classic alarm clock)
-				// Each beep is 200ms on, 150ms off
+				// Alarm pattern: 3 beeps at 880 Hz (A5 — sharp, attention-grabbing)
+				double beepHz      = 880.0;
+				int beepSamples    = (int)(sampleRate * 0.20); // 200ms on
+				int silenceSamples = (int)(sampleRate * 0.15); // 150ms off
 				int beepCount      = 3;
-				double beepHz      = 880.0;  // Frequency in Hz — 880 = A5, a sharp alarm tone
-				int beepSamples    = (int)(sampleRate * 0.20); // 200ms worth of samples
-				int silenceSamples = (int)(sampleRate * 0.15); // 150ms silence between beeps
 				int totalSamples   = beepCount * (beepSamples + silenceSamples);
 
-				// Each sample is 2 bytes (16-bit), so the buffer is twice the sample count
-				byte[] buffer = new byte[totalSamples * 2];
+				// PCM data buffer — 2 bytes per sample (16-bit)
+				byte[] pcm = new byte[totalSamples * 2];
+				int pos = 0;
 
-				int bufferPos = 0;
 				for (int beep = 0; beep < beepCount; beep++)
 				{
-					// --- Write beep samples (sine wave) ---
+					// Sine wave samples for the beep tone
 					for (int i = 0; i < beepSamples; i++)
 					{
-						// Sine wave formula: amplitude * sin(2π * frequency * time)
-						// We scale down volume slightly (0.6) so it's not ear-splitting
-						double angle     = 2.0 * Math.PI * beepHz * i / sampleRate;
-						short  sample    = (short)(Short.MAX_VALUE * 0.6 * Math.sin(angle));
-
-						// Split 16-bit short into 2 bytes (big-endian: high byte first)
-						buffer[bufferPos++] = (byte)(sample >> 8);
-						buffer[bufferPos++] = (byte)(sample & 0xFF);
+						double angle  = 2.0 * Math.PI * beepHz * i / sampleRate;
+						short  sample = (short)(Short.MAX_VALUE * 0.6 * Math.sin(angle));
+						// Big-endian: high byte first
+						pcm[pos++] = (byte)(sample >> 8);
+						pcm[pos++] = (byte)(sample & 0xFF);
 					}
-
-					// --- Write silence samples (all zeros = silence) ---
+					// Silence between beeps (zero samples)
 					for (int i = 0; i < silenceSamples; i++)
 					{
-						buffer[bufferPos++] = 0;
-						buffer[bufferPos++] = 0;
+						pcm[pos++] = 0;
+						pcm[pos++] = 0;
 					}
 				}
 
-				// Wrap our raw byte array in an AudioInputStream so Java can play it
-				DataLine.Info info = new DataLine.Info(Clip.class, format);
-				Clip clip = (Clip) AudioSystem.getLine(info);
-				clip.open(format, buffer, 0, buffer.length);
-				clip.start();
+				// --- Build a valid .wav file in memory ---
+				// A .wav file = a RIFF header + a fmt chunk + a data chunk + the PCM bytes.
+				// We write this manually so we don't need javax.sound to create it.
+				int dataSize   = pcm.length;
+				int byteRate   = sampleRate * channels * (bitsPerSample / 8);
+				int blockAlign = channels * (bitsPerSample / 8);
 
-				clip.addLineListener(e ->
-				{
-					if (e.getType() == LineEvent.Type.STOP)
-					{
-						clip.close();
-					}
-				});
+				ByteArrayInputStream wavStream = new ByteArrayInputStream(buildWavBytes(
+						sampleRate, channels, bitsPerSample, byteRate, blockAlign, pcm
+				));
+
+				// Write to a temporary file — AudioPlayer needs a File, not a stream
+				tempFile = Files.createTempFile("randomtimer_beep", ".wav");
+				Files.write(tempFile, wavStream.readAllBytes());
+
+				// Play via RuneLite's approved AudioPlayer API
+				AudioPlayer.play(tempFile.toFile());
+
+				// Give the audio time to finish before deleting the temp file
+				Thread.sleep(2500);
 			}
 			catch (Exception e)
 			{
-				log.error("Failed to play generated alarm sound", e);
+				log.error("Failed to play generated alarm", e);
+			}
+			finally
+			{
+				// Always clean up the temp file — even if playback failed
+				if (tempFile != null)
+				{
+					try { Files.deleteIfExists(tempFile); }
+					catch (Exception ignored) {}
+				}
 			}
 		}).start();
+	}
+
+	/**
+	 * Builds a valid WAV file byte array from raw PCM data.
+	 * A WAV file is a RIFF container with a fixed header structure.
+	 * We write all multi-byte integers in little-endian order (least significant byte first),
+	 * which is what the WAV spec requires.
+	 *
+	 * @return Complete .wav file as a byte array, ready to write to disk
+	 */
+	private byte[] buildWavBytes(int sampleRate, int channels, int bitsPerSample,
+	                             int byteRate, int blockAlign, byte[] pcm)
+	{
+		int dataSize   = pcm.length;
+		int chunkSize  = 36 + dataSize; // Total file size minus the 8-byte RIFF header
+
+		byte[] wav = new byte[44 + dataSize]; // 44-byte header + PCM data
+		int i = 0;
+
+		// RIFF chunk descriptor
+		wav[i++] = 'R'; wav[i++] = 'I'; wav[i++] = 'F'; wav[i++] = 'F';
+		wav[i++] = (byte)(chunkSize);        wav[i++] = (byte)(chunkSize >> 8);
+		wav[i++] = (byte)(chunkSize >> 16);  wav[i++] = (byte)(chunkSize >> 24);
+		wav[i++] = 'W'; wav[i++] = 'A'; wav[i++] = 'V'; wav[i++] = 'E';
+
+		// fmt sub-chunk
+		wav[i++] = 'f'; wav[i++] = 'm'; wav[i++] = 't'; wav[i++] = ' ';
+		wav[i++] = 16; wav[i++] = 0; wav[i++] = 0; wav[i++] = 0; // Sub-chunk size (16 for PCM)
+		wav[i++] = 1;  wav[i++] = 0;                              // Audio format (1 = PCM)
+		wav[i++] = (byte)(channels);        wav[i++] = 0;
+		wav[i++] = (byte)(sampleRate);      wav[i++] = (byte)(sampleRate >> 8);
+		wav[i++] = (byte)(sampleRate >> 16); wav[i++] = (byte)(sampleRate >> 24);
+		wav[i++] = (byte)(byteRate);        wav[i++] = (byte)(byteRate >> 8);
+		wav[i++] = (byte)(byteRate >> 16);  wav[i++] = (byte)(byteRate >> 24);
+		wav[i++] = (byte)(blockAlign);      wav[i++] = 0;
+		wav[i++] = (byte)(bitsPerSample);   wav[i++] = 0;
+
+		// data sub-chunk
+		wav[i++] = 'd'; wav[i++] = 'a'; wav[i++] = 't'; wav[i++] = 'a';
+		wav[i++] = (byte)(dataSize);        wav[i++] = (byte)(dataSize >> 8);
+		wav[i++] = (byte)(dataSize >> 16);  wav[i++] = (byte)(dataSize >> 24);
+
+		// Copy PCM data into the wav array after the header
+		System.arraycopy(pcm, 0, wav, 44, dataSize);
+
+		return wav;
 	}
 
 	// --- Getters used by the Overlay and Panel ---
